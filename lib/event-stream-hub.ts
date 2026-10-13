@@ -2,7 +2,6 @@ import { randomUUID } from "crypto";
 import fs from "fs";
 import { authorizeFileAccess } from "./file-authorization";
 import { filePathApiSegments } from "./file-paths";
-import { isValidNotificationId } from "./notification-events";
 import { attachNotificationClient } from "./notification-hub";
 import { getExitedRpcSessions, getRpcSession, getRunningRpcSessions, subscribeHostToolCalls, subscribeRunningSessions } from "./rpc-manager";
 import { subscribeSessionFileChanges } from "./session-watcher";
@@ -228,7 +227,9 @@ export class EventStreamConnection {
 async function openChannel(channel: EventStreamChannel, handle: SubscriptionHandle): Promise<SubscribeResult> {
   switch (channel.kind) {
     case "running":
-      return openRunningChannel(channel.clientId, handle);
+      return openRunningChannel(handle);
+    case "notifications":
+      return openNotificationsChannel(channel.clientId, handle);
     case "session":
       return openSessionChannel(channel.sessionId, handle);
     case "file":
@@ -238,9 +239,8 @@ async function openChannel(channel: EventStreamChannel, handle: SubscriptionHand
   }
 }
 
-// Running-session ids plus session-list refresh hints for the sidebar, and
-// the notifications routed to the tab whose `clientId` this is.
-function openRunningChannel(clientId: string | null, handle: SubscriptionHandle): SubscribeResult {
+// Running-session ids plus session-list refresh hints for the sidebar.
+function openRunningChannel(handle: SubscriptionHandle): SubscribeResult {
   handle.open();
   // Subscribe BEFORE taking the initial snapshot so no state change can slip
   // through the gap between snapshot and subscription.
@@ -256,13 +256,9 @@ function openRunningChannel(clientId: string | null, handle: SubscriptionHandle)
   const unsubscribeFiles = subscribeSessionFileChanges((sessionIds) => {
     handle.send({ type: "sessions-changed", sessionIds, refreshSessionList: true });
   });
-  const detachNotifications = isValidNotificationId(clientId)
-    ? attachNotificationClient(clientId, (message) => handle.send({ type: "notification", ...message }))
-    : null;
   handle.setDetach(() => {
     unsubscribeRunning();
     unsubscribeFiles();
-    detachNotifications?.();
   });
   const initialRunning = getRunningRpcSessions();
   handle.send({
@@ -271,6 +267,14 @@ function openRunningChannel(clientId: string | null, handle: SubscriptionHandle)
     runningSessions: initialRunning,
     exitedSessions: getExitedRpcSessions(),
   });
+  return SUBSCRIBED;
+}
+
+// The notifications the server routes to one tab (`clientId`). The tab counts
+// as reachable for toasts and in-page system notifications while this is open.
+function openNotificationsChannel(clientId: string, handle: SubscriptionHandle): SubscribeResult {
+  handle.open();
+  handle.setDetach(attachNotificationClient(clientId, (message) => handle.send({ type: "notification", ...message })));
   return SUBSCRIBED;
 }
 

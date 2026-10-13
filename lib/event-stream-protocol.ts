@@ -14,6 +14,8 @@
 // public/event-stream-worker.js is a plain script (not bundled) and mirrors
 // these constants; keep the two in sync.
 
+import { isValidNotificationId } from "./notification-events";
+
 export const EVENT_STREAM_PATH = "/api/events";
 export const MUX_CONTROL_EVENT = "mux";
 /** Subscription ids double as SSE event names: no whitespace, never "mux"/"message". */
@@ -21,8 +23,9 @@ export const SUBSCRIPTION_ID_RE = /^s[0-9]{1,15}$/;
 export const UNKNOWN_CONNECTION_CODE = "unknown_connection";
 
 export type EventStreamChannel =
-  /** `clientId` (a tab's notification client id) also routes that tab's notifications here. */
-  | { kind: "running"; clientId: string | null }
+  | { kind: "running" }
+  /** Notifications the server routes to the tab with this notification client id. */
+  | { kind: "notifications"; clientId: string }
   | { kind: "session"; sessionId: string }
   | { kind: "file"; path: string; sessionId: string | null }
   /** Host tool calls (open_url, notify, open_file) from sessions no tab is watching. */
@@ -48,12 +51,10 @@ export function parseEventStreamChannel(value: unknown): EventStreamChannel | nu
   if (!value || typeof value !== "object") return null;
   const channel = value as Record<string, unknown>;
   switch (channel.kind) {
-    case "running": {
-      // Validated by the notification hub's id check when attached; here only bounded.
-      const clientId = channel.clientId ?? null;
-      if (clientId !== null && !isBoundedString(clientId, MAX_ID_LENGTH)) return null;
-      return { kind: "running", clientId };
-    }
+    case "running":
+      return { kind: "running" };
+    case "notifications":
+      return isValidNotificationId(channel.clientId) ? { kind: "notifications", clientId: channel.clientId } : null;
     case "host-tools":
       return { kind: "host-tools" };
     case "session":

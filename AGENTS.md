@@ -358,14 +358,18 @@ during the wait.
   CLOSED = fatal (e.g. 409 for a wrapper-less session; the chat hook then
   retries with backoff). Dead tabs are detected with a lifetime Web Lock —
   MessagePort has no close event.
-- Channels (`lib/event-stream-hub.ts`): `running` (sidebar badges,
-  session-list hints, and the tab's notifications when its `clientId` is
-  given), `host-tools` (cross-session `open_url`/`notify`/`open_file` calls,
-  one per tab from `AppShell` so they keep working on the Settings page),
-  `session` (observer-only, never spawns omp; keeps the
-  latest-wins `message_update` coalescing under backpressure), `file`
-  (viewer watch, same allow-list as `/api/files`). A failing frame ends only
-  its own subscription, never the shared socket.
+- Channels (`lib/event-stream-hub.ts`): `running` (sidebar badges +
+  session-list hints), `notifications` (one tab's toasts and in-page system
+  notifications, keyed by its `clientId`), `host-tools` (cross-session
+  `open_url`/`notify`/`open_file` calls), `session` (observer-only, never
+  spawns omp; keeps the latest-wins `message_update` coalescing under
+  backpressure), `file` (viewer watch, same allow-list as `/api/files`). A
+  failing frame ends only its own subscription, never the shared socket.
+- Split channels by consumer, lifetime, key and access check, not by which
+  stream happens to be open: a subscription costs one `POST`, not a socket, so
+  never piggyback a frame type on another consumer's channel. `notifications`
+  and `host-tools` are subscribed from `AppShell`, so they outlive the sidebar
+  (which unmounts while Settings is open).
 
 ### Running state + reconciliation
 - The sidebar subscribes to the `running` channel, backed by `subscribeRunningSessions()` in `lib/rpc-manager.ts`, so running badges update without polling.
@@ -701,12 +705,10 @@ during the wait.
   devices) or in-page `showNotification` (tabs with an open stream).
 - The server decides before pushing: iOS revokes push permission for pushes
   that display nothing, so `public/sw.js` always shows what it receives.
-- Notifications ride the sidebar's `running` channel (`clientId` = the tab's
-  notification client id), not a new stream: browsers allow six HTTP/1.1
-  connections per host (see "Live event stream" above).
-  `SessionSidebar` re-dispatches them as a window event. The sidebar unmounts
-  while Settings is open, so that tab gets no toasts then; it also stops
-  counting as active, so other devices are not silenced.
+- Notifications have their own `notifications` channel (`clientId` = the
+  tab's notification client id), opened by `useNotifications` in `AppShell`,
+  so a tab stays reachable on every view, Settings included. A tab on
+  Settings is visible, so it also counts as active.
 - Prefs and push subscriptions are per device, in `localStorage` and mirrored to
   the SQLite notification store in omp-web's data dir
   (`lib/notification-store.ts`, server-only; mode 0600 because it also holds
