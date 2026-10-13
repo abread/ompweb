@@ -26,15 +26,16 @@ Browser                Next.js Server                    omp child process
   │                        │                                    │
   ├─ GET /api/sessions ────▶ reads ~/.omp/agent/sessions/       │
   ├─ GET /api/sessions/[id] reads .jsonl file directly          │
-  ├─ GET /api/agent/running/events ───▶ running id SSE          │
+  ├─ SharedWorker ── GET /api/events ──▶ ONE multiplexed SSE per browser │
+  │   (all tabs)     POST /api/events ─▶ subscribe running/session/file  │
   │                        │                                    │
   ├─ send message ─────────▶ POST /api/agent/[id]               │
   │                        │   startRpcSession() ── spawn ─────▶│ omp --mode rpc-ui
   │                        │   sendCommand({type:"prompt"}) ───▶│ (NDJSON stdio)
   │                        │                                    │
-  ├─ SSE connect ──────────▶ GET /api/agent/[id]/events         │
+  ├─ session subscription ─▶ event-stream-hub onEvent()            │
   │                        │   onFrame() ◀── event frames ──────│
-  │◀── data: {...} ─────────│                                    │
+  │◀── event: s<n> data: {...} ──│                               │
 ```
 
 **Session browsing** (read-only): pure-Node parsing of omp session `.jsonl`
@@ -63,8 +64,7 @@ app/api/
   sessions/[id]/export/route.ts   GET exported HTML for a session
   agent/new/route.ts              POST { cwd, message, toolNames?, provider?, modelId? }
   agent/[id]/route.ts             GET state | POST any RPC command
-  agent/[id]/events/route.ts      GET SSE stream
-  agent/running/events/route.ts   GET SSE stream of currently-running session ids (+ this tab's notifications)
+  events/route.ts                 GET multiplexed SSE | POST subscribe/unsubscribe channels
   notifications/devices/route.ts  GET VAPID key + subscribed | PUT { deviceId, prefs, subscription? }
   notifications/presence/route.ts POST { clientId, deviceId, visible, sessionId, seq }
   notifications/test/route.ts     POST { deviceId } send a test push (502 on push-service refusal)
@@ -99,7 +99,11 @@ lib/
   agent-client.ts      typed fetch helper for /api/agent commands
   btw.ts               /btw side-question records + pure frame/snapshot merge (order-safe)
   draft-store.ts       local draft persistence helpers
+  event-stream.ts      tab-side EventSource-shaped streams over the shared worker
+  event-stream-hub.ts  server connections + running/session/file channels for /api/events
+  event-stream-protocol.ts  wire contract shared by hub, route, and facade
   file-access.ts       allowed file roots for /api/files and worktrees
+  file-authorization.ts  single allow-list gate for /api/files and the file channel
   media-cache.ts       tool-result images → /api/media URLs; media copies + thumbnails
   file-paths.ts        client/server path encoding helpers
   github-refs.ts       remark plugin linking #N / owner/repo#N + GithubRepoContext
@@ -338,9 +342,34 @@ during the wait.
   reason:"shellRunning"}`), which the hook surfaces as a notice while rolling
   the phantom optimistic turn back. The chip still comes from omp's snapshot.
 
-### Running state SSE + reconciliation
-- The sidebar listens to `/api/agent/running/events`, backed by `subscribeRunningSessions()` in `lib/rpc-manager.ts`, so running badges update without polling.
-- `useAgentSession` still treats per-session SSE as primary for chat events, but while a run is active it periodically calls `GET /api/agent/[id]` and also reconciles on `visibilitychange`/`online`. This fixes missed `agent_end` events from background tabs or half-open connections.
+### Live event stream: one socket per browser (`/api/events`)
+- Browsers cap HTTP/1.1 at **6 connections per host across all tabs**, and an
+  SSE response pins one for its lifetime. Per-stream SSE (sidebar + host
+  tools + chat + file watch per tab) froze everything after ~2 tabs, so
+  **never add a new `EventSource`** for live data: add a channel instead.
+- `public/event-stream-worker.js` (plain script, SharedWorker; dedicated
+  Worker where SharedWorker is missing) holds the only `/api/events`
+  EventSource and multiplexes every tab's subscriptions: frames arrive as
+  `event: <subId>`, control frames as `event: mux` (`hello`/`open`/`end`).
+  Subscriptions are attached with `POST /api/events`. Its URL carries a
+  content hash (`next.config.ts`) so a changed worker never serves stale tabs.
+- Tabs use `openEventStream(channel)` (`lib/event-stream.ts`), which keeps
+  EventSource semantics: `onerror` + CONNECTING = reconnecting on its own,
+  CLOSED = fatal (e.g. 409 for a wrapper-less session; the chat hook then
+  retries with backoff). Dead tabs are detected with a lifetime Web Lock —
+  MessagePort has no close event.
+- Channels (`lib/event-stream-hub.ts`): `running` (sidebar badges,
+  session-list hints, and the tab's notifications when its `clientId` is
+  given), `host-tools` (cross-session `open_url`/`notify`/`open_file` calls,
+  one per tab from `AppShell` so they keep working on the Settings page),
+  `session` (observer-only, never spawns omp; keeps the
+  latest-wins `message_update` coalescing under backpressure), `file`
+  (viewer watch, same allow-list as `/api/files`). A failing frame ends only
+  its own subscription, never the shared socket.
+
+### Running state + reconciliation
+- The sidebar subscribes to the `running` channel, backed by `subscribeRunningSessions()` in `lib/rpc-manager.ts`, so running badges update without polling.
+- `useAgentSession` still treats its `session` channel as primary for chat events, but while a run is active it periodically calls `GET /api/agent/[id]` and also reconciles on `visibilitychange`/`online`. This fixes missed `agent_end` events from background tabs or half-open connections.
 - Prompt runs use a monotonic run id; late SSE or slow reconciliation responses from an old run must be ignored so they cannot resurrect stale streaming bubbles.
 
 ### Composer-attached panels (`components/ComposerPanels.tsx`)
@@ -672,8 +701,9 @@ during the wait.
   devices) or in-page `showNotification` (tabs with an open stream).
 - The server decides before pushing: iOS revokes push permission for pushes
   that display nothing, so `public/sw.js` always shows what it receives.
-- Notifications ride the sidebar's `/api/agent/running/events?clientId=` stream,
-  not a new SSE connection: browsers allow six HTTP/1.1 connections per host.
+- Notifications ride the sidebar's `running` channel (`clientId` = the tab's
+  notification client id), not a new stream: browsers allow six HTTP/1.1
+  connections per host (see "Live event stream" above).
   `SessionSidebar` re-dispatches them as a window event. The sidebar unmounts
   while Settings is open, so that tab gets no toasts then; it also stops
   counting as active, so other devices are not silenced.

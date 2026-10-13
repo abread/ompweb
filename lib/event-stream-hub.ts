@@ -4,7 +4,7 @@ import { authorizeFileAccess } from "./file-authorization";
 import { filePathApiSegments } from "./file-paths";
 import { isValidNotificationId } from "./notification-events";
 import { attachNotificationClient } from "./notification-hub";
-import { getRpcSession, getRunningRpcSessions, subscribeHostToolCalls, subscribeRunningSessions } from "./rpc-manager";
+import { getExitedRpcSessions, getRpcSession, getRunningRpcSessions, subscribeHostToolCalls, subscribeRunningSessions } from "./rpc-manager";
 import { subscribeSessionFileChanges } from "./session-watcher";
 import {
   MUX_CONTROL_EVENT,
@@ -244,11 +244,12 @@ function openRunningChannel(clientId: string | null, handle: SubscriptionHandle)
   handle.open();
   // Subscribe BEFORE taking the initial snapshot so no state change can slip
   // through the gap between snapshot and subscription.
-  const unsubscribeRunning = subscribeRunningSessions(({ ids, runningSessions, refreshSessionList }) => {
+  const unsubscribeRunning = subscribeRunningSessions(({ ids, runningSessions, exitedSessions, refreshSessionList }) => {
     handle.send({
       type: "running",
       runningSessionIds: ids,
       runningSessions,
+      exitedSessions,
       ...(refreshSessionList ? { refreshSessionList: true } : {}),
     });
   });
@@ -268,6 +269,7 @@ function openRunningChannel(clientId: string | null, handle: SubscriptionHandle)
     type: "running",
     runningSessionIds: initialRunning.map((session) => session.id),
     runningSessions: initialRunning,
+    exitedSessions: getExitedRpcSessions(),
   });
   return SUBSCRIBED;
 }
